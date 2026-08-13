@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Maya autosaves, scene files, and local project state
+autosave/
+*.ma
+*.mb
+workspace.mel
+
+# Generated previews and editor metadata
+*.png
+.idea/
+.vscode/
