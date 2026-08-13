@@ -11,7 +11,9 @@ import json
 import math
 import os
 import tempfile
+import threading
 import time
+import traceback
 from typing import Dict, List, Sequence, Tuple
 
 import maya.api.OpenMaya as om
@@ -22,7 +24,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 import voronoi_geometry_core as core
 
 
-TOOL_VERSION = "0.1.1"
+TOOL_VERSION = "0.2.0"
 WINDOW_OBJECT = "VoronoiGeometryBakerWindow"
 PREVIEW_GROUP = "VORONOI_GEO_PREVIEW_GRP"
 PREVIEW_PLANE = "voronoiGeo_previewPlane"
@@ -141,6 +143,70 @@ class IntControl(QtWidgets.QWidget):
         return int(self.spin.value())
 
 
+class PreviewWorkerSignals(QtCore.QObject):
+    finished = QtCore.Signal(object)
+
+
+class PreviewWorker(QtCore.QRunnable):
+    """Pure-Python preview job; it never calls Maya commands off-thread."""
+
+    def __init__(
+        self,
+        request_id,
+        job_id,
+        parameters,
+        sample_width,
+        sample_height,
+        texture_width,
+        texture_height,
+        flow_density,
+        quality,
+        cancel_event,
+    ):
+        super().__init__()
+        self.request_id = request_id
+        self.job_id = job_id
+        self.parameters = parameters
+        self.sample_width = sample_width
+        self.sample_height = sample_height
+        self.texture_width = texture_width
+        self.texture_height = texture_height
+        self.flow_density = flow_density
+        self.quality = quality
+        self.cancel_event = cancel_event
+        self.signals = PreviewWorkerSignals()
+
+    def run(self):
+        started = time.perf_counter()
+        pixels = None
+        error = ""
+        try:
+            pixels = core.render_preview_rgb(
+                self.parameters,
+                self.sample_width,
+                self.sample_height,
+                flow_samples_per_unit=self.flow_density,
+                cancelled=self.cancel_event.is_set,
+            )
+        except Exception:
+            error = traceback.format_exc()
+        self.signals.finished.emit(
+            {
+                "request_id": self.request_id,
+                "job_id": self.job_id,
+                "pixels": pixels,
+                "sample_width": self.sample_width,
+                "sample_height": self.sample_height,
+                "texture_width": self.texture_width,
+                "texture_height": self.texture_height,
+                "elapsed": time.perf_counter() - started,
+                "quality": self.quality,
+                "error": error,
+                "cancelled": self.cancel_event.is_set(),
+            }
+        )
+
+
 class VoronoiGeometryWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent=parent)
@@ -149,11 +215,22 @@ class VoronoiGeometryWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         self.setMinimumWidth(390)
         self._preview_generation = 0
         self._preview_plane_exists = False
+        self._preview_request_id = 0
+        self._preview_job_id = 0
+        self._preview_cancel_event = None
+        self._preview_jobs = {}
+        self.preview_pool = QtCore.QThreadPool(self)
+        self.preview_pool.setMaxThreadCount(1)
 
         self.preview_timer = QtCore.QTimer(self)
         self.preview_timer.setSingleShot(True)
-        self.preview_timer.setInterval(220)
-        self.preview_timer.timeout.connect(self.refresh_preview)
+        self.preview_timer.setInterval(80)
+        self.preview_timer.timeout.connect(self._start_interactive_preview)
+
+        self.preview_quality_timer = QtCore.QTimer(self)
+        self.preview_quality_timer.setSingleShot(True)
+        self.preview_quality_timer.setInterval(650)
+        self.preview_quality_timer.timeout.connect(self._start_quality_preview)
 
         self._build_ui()
         self._connect_controls()
@@ -222,7 +299,9 @@ class VoronoiGeometryWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         self.bake_box.layout().addWidget(self.initial_rays)
         self.max_refinement = IntControl("Max curve refinement", 0, 6, 4)
         self.bake_box.layout().addWidget(self.max_refinement)
-        self.preview_resolution = IntControl("Preview resolution", 32, 192, 96)
+        self.preview_detail = IntControl("Preview detail (samples)", 48, 512, 192)
+        self.bake_box.layout().addWidget(self.preview_detail)
+        self.preview_resolution = IntControl("Preview texture (px)", 128, 2048, 768)
         self.bake_box.layout().addWidget(self.preview_resolution)
 
         self.estimate = QtWidgets.QLabel()
@@ -305,6 +384,7 @@ class VoronoiGeometryWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             self.seed,
             self.initial_rays,
             self.max_refinement,
+            self.preview_detail,
             self.preview_resolution,
         ):
             control.valueChanged.connect(self._parameters_changed)
@@ -317,7 +397,9 @@ class VoronoiGeometryWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         self._update_estimate()
         if cmds.objExists(PREVIEW_PLANE):
             self._resize_preview_plane()
+            self._invalidate_preview()
             self.preview_timer.start()
+            self.preview_quality_timer.start()
 
     def _update_estimate(self):
         estimated_cells = max(
@@ -478,83 +560,163 @@ class VoronoiGeometryWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         )
         return os.path.join(tempfile.gettempdir(), filename)
 
-    def _render_preview(self, parameters: core.VoronoiParameters, path: str):
-        longest = max(32, int(self.preview_resolution.value()))
+    @staticmethod
+    def _preview_dimensions(longest, parameters, minimum_short_edge):
+        longest = max(minimum_short_edge, int(longest))
         if parameters.width >= parameters.depth:
-            pixel_width = longest
-            pixel_height = max(
-                32, int(round(longest * parameters.depth / parameters.width))
+            return (
+                longest,
+                max(
+                    minimum_short_edge,
+                    int(round(longest * parameters.depth / parameters.width)),
+                ),
+            )
+        return (
+            max(
+                minimum_short_edge,
+                int(round(longest * parameters.width / parameters.depth)),
+            ),
+            longest,
+        )
+
+    def _invalidate_preview(self):
+        self._preview_request_id += 1
+        if self._preview_cancel_event is not None:
+            self._preview_cancel_event.set()
+
+    def _start_interactive_preview(self):
+        self._start_preview_job(quality=False)
+
+    def _start_quality_preview(self):
+        self._start_preview_job(quality=True)
+
+    def _start_preview_job(self, quality):
+        if not cmds.objExists(PREVIEW_PLANE):
+            return
+        if self._preview_cancel_event is not None:
+            self._preview_cancel_event.set()
+
+        parameters = self.parameters()
+        detail = max(48, int(self.preview_detail.value()))
+        sample_longest = detail if quality else min(detail, 96)
+        texture_longest = max(128, int(self.preview_resolution.value()))
+        sample_width, sample_height = self._preview_dimensions(
+            sample_longest,
+            parameters,
+            24,
+        )
+        texture_width, texture_height = self._preview_dimensions(
+            texture_longest,
+            parameters,
+            64,
+        )
+
+        self._preview_job_id += 1
+        job_id = self._preview_job_id
+        cancel_event = threading.Event()
+        self._preview_cancel_event = cancel_event
+        worker = PreviewWorker(
+            self._preview_request_id,
+            job_id,
+            parameters,
+            sample_width,
+            sample_height,
+            texture_width,
+            texture_height,
+            6.0 if quality else 4.0,
+            quality,
+            cancel_event,
+        )
+        worker.signals.finished.connect(self._preview_finished)
+        self._preview_jobs[job_id] = worker
+        label = "quality" if quality else "interactive"
+        self.status.setText(
+            "Rendering {} preview ({} samples to {} px)...".format(
+                label,
+                max(sample_width, sample_height),
+                max(texture_width, texture_height),
+            )
+        )
+        self.preview_pool.start(worker)
+
+    def _preview_finished(self, result):
+        self._preview_jobs.pop(result["job_id"], None)
+        if result["error"]:
+            if result["request_id"] == self._preview_request_id:
+                self.status.setText("Preview failed; see Script Editor.")
+                cmds.warning(result["error"])
+            return
+        if result["cancelled"] or result["pixels"] is None:
+            return
+        if (
+            result["request_id"] != self._preview_request_id
+            or result["job_id"] != self._preview_job_id
+        ):
+            return
+
+        source_stride = result["sample_width"] * 3
+        image_stride = (source_stride + 3) & ~3
+        if image_stride == source_stride:
+            pixel_bytes = bytes(result["pixels"])
+        else:
+            padded_pixels = bytearray(image_stride * result["sample_height"])
+            for row in range(result["sample_height"]):
+                source_start = row * source_stride
+                target_start = row * image_stride
+                padded_pixels[target_start : target_start + source_stride] = (
+                    result["pixels"][source_start : source_start + source_stride]
+                )
+            pixel_bytes = bytes(padded_pixels)
+        image = QtGui.QImage(
+            pixel_bytes,
+            result["sample_width"],
+            result["sample_height"],
+            image_stride,
+            QtGui.QImage.Format.Format_RGB888,
+        ).copy()
+        if (
+            image.width() != result["texture_width"]
+            or image.height() != result["texture_height"]
+        ):
+            image = image.scaled(
+                result["texture_width"],
+                result["texture_height"],
+                QtCore.Qt.AspectRatioMode.IgnoreAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation,
+            )
+
+        path = self._preview_image_path()
+        if not image.save(path, "PNG"):
+            self.status.setText("Preview failed while saving the PNG.")
+            cmds.warning("Qt could not save the preview PNG: " + path)
+            return
+        cmds.setAttr(PREVIEW_FILE + ".fileTextureName", path, type="string")
+        cmds.dgdirty(PREVIEW_FILE)
+        cmds.refresh(force=True)
+
+        if result["quality"]:
+            self.status.setText(
+                "Preview refined: {} samples to {} px in {:.2f}s. Bake remains equation-based.".format(
+                    max(result["sample_width"], result["sample_height"]),
+                    max(result["texture_width"], result["texture_height"]),
+                    result["elapsed"],
+                )
             )
         else:
-            pixel_height = longest
-            pixel_width = max(
-                32, int(round(longest * parameters.width / parameters.depth))
+            self.status.setText(
+                "Interactive preview: {} samples to {} px in {:.2f}s; refining after idle.".format(
+                    max(result["sample_width"], result["sample_height"]),
+                    max(result["texture_width"], result["texture_height"]),
+                    result["elapsed"],
+                )
             )
-
-        field = core.VoronoiField(parameters)
-        image = QtGui.QImage(
-            pixel_width,
-            pixel_height,
-            QtGui.QImage.Format.Format_RGB888,
-        )
-        image.fill(QtGui.QColor(255, 255, 255))
-        pixel_size = max(
-            parameters.pattern_width / float(pixel_width),
-            parameters.pattern_height / float(pixel_height),
-        )
-        anti_alias = max(pixel_size * 0.70, 0.001)
-        half_width = max(parameters.edge_width, 0.001) * 0.5
-        palette = ((255, 0, 0), (0, 255, 0), (0, 0, 255))
-
-        for image_y in range(pixel_height):
-            pattern_y = parameters.pattern_height * (
-                pixel_height - image_y - 0.5
-            ) / pixel_height
-            for image_x in range(pixel_width):
-                pattern_x = parameters.pattern_width * (
-                    image_x + 0.5
-                ) / pixel_width
-                point = (pattern_x, pattern_y)
-                sample = field.evaluate(point, with_boundary=True)
-                domain_margin = min(
-                    pattern_x,
-                    parameters.pattern_width - pattern_x,
-                    pattern_y,
-                    parameters.pattern_height - pattern_y,
-                )
-                margin = min(sample.boundary, domain_margin) - half_width
-                amount = core.smoothstep(-anti_alias, anti_alias, margin)
-                fill = palette[field.color_index(sample.winner)]
-                rgb = tuple(
-                    int(round(255.0 + (channel - 255.0) * amount))
-                    for channel in fill
-                )
-                image.setPixelColor(image_x, image_y, QtGui.QColor(*rgb))
-        if not image.save(path, "PNG"):
-            raise RuntimeError("Qt could not save the preview PNG: " + path)
 
     def refresh_preview(self):
         if not cmds.objExists(PREVIEW_PLANE):
             return
-        parameters = self.parameters()
-        path = self._preview_image_path()
-        self.status.setText("Updating viewport preview…")
-        QtWidgets.QApplication.processEvents()
-        started = time.perf_counter()
-        try:
-            self._render_preview(parameters, path)
-            cmds.setAttr(PREVIEW_FILE + ".fileTextureName", path, type="string")
-            cmds.dgdirty(PREVIEW_FILE)
-            cmds.refresh(force=True)
-        except Exception as exc:
-            self.status.setText("Preview failed: {}".format(exc))
-            raise
-        elapsed = time.perf_counter() - started
-        self.status.setText(
-            "Preview updated in {:.2f}s. Geometry bake remains equation-based.".format(
-                elapsed
-            )
-        )
+        self._invalidate_preview()
+        self._start_interactive_preview()
+        self.preview_quality_timer.start()
 
     def hide_preview(self):
         if cmds.objExists(PREVIEW_GROUP):
@@ -563,6 +725,15 @@ class VoronoiGeometryWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             self.hide_preview_button.setText(
                 "Show Preview" if current else "Hide Preview"
             )
+
+    def closeEvent(self, event):
+        self.preview_timer.stop()
+        self.preview_quality_timer.stop()
+        for worker in list(self._preview_jobs.values()):
+            worker.cancel_event.set()
+        self.preview_pool.clear()
+        self.preview_pool.waitForDone(1500)
+        super().closeEvent(event)
 
     def bake(self):
         parameters = self.parameters()

@@ -43,6 +43,24 @@ The PNG is written with Qt's built-in `QImage`; Pillow is not used. The
 preview is solely interactive feedback and is never used by the geometry
 bake.
 
+Preview rendering is progressive and cancellable. Parameter changes request
+a fast 96-sample interactive pass after 80 ms, followed by a higher-quality
+pass after 650 ms of idle time. The CPU field calculation runs in a dedicated
+Qt worker so Maya's UI can continue processing input. Superseded jobs stop
+between scanlines instead of finishing stale images.
+
+Two controls separate mathematical sampling cost from displayed texture size:
+
+- **Preview detail (samples)** controls the refined field evaluation. It
+  defaults to 192 and can be raised to 512.
+- **Preview texture (px)** controls the generated PNG's longest side. It
+  defaults to 768 and can be raised to 2048.
+
+The preview-specific evaluator retains the exact sites, weights, colors,
+edge-width calculation, and rounded distance metric while interpolating the
+smooth flow orientation from a compact grid. Geometry tracing still uses the
+full exact evaluator.
+
 ## Geometry bake
 
 Click **Bake Four Meshes** to create a new group containing:
@@ -89,7 +107,7 @@ Each bake group stores a JSON snapshot of its settings in the custom
 
 1. Save the Maya scene.
 2. Launch J-Voroni.
-3. Create the preview at the default resolution.
+3. Create the preview at the default 192-sample / 768-pixel settings.
 4. Adjust Tributary Bias and Channel Parallelism and confirm that the preview
    responds.
 5. Bake the four meshes.

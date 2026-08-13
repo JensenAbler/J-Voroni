@@ -146,7 +146,10 @@ class VoronoiField:
     def __init__(self, parameters: VoronoiParameters):
         self.parameters = parameters
         self._site_cache: Dict[CellId, _SiteInfo] = {}
-        self._segment_cache: Dict[CellId, List[Tuple[float, float, float, float, float]]] = {}
+        self._segment_cache: Dict[
+            CellId,
+            List[Tuple[float, float, float, float, float, float, float, float]],
+        ] = {}
 
     def _hash(self, point: Vec2, salt: Vec2 = (0.0, 0.0)) -> Vec2:
         seed_offset = self.parameters.seed_offset
@@ -178,7 +181,7 @@ class VoronoiField:
 
     def _segments_for_tile(
         self, tile_id: CellId
-    ) -> List[Tuple[float, float, float, float, float]]:
+    ) -> List[Tuple[float, float, float, float, float, float, float, float]]:
         cached = self._segment_cache.get(tile_id)
         if cached is not None:
             return cached
@@ -192,21 +195,46 @@ class VoronoiField:
             local = self._tree_node(index, count, height, tile_id)
             return (origin[0] + local[0], origin[1] + local[1])
 
-        segments: List[Tuple[float, float, float, float, float]] = []
+        raw_segments: List[Tuple[float, float, float, float, float]] = []
         root = global_node(0.0, 1.0, 0.18)
-        segments.append((root[0], origin[1], root[0], root[1], 3.0))
+        raw_segments.append((root[0], origin[1], root[0], root[1], 3.0))
 
         for child in range(2):
             end = global_node(float(child), 2.0, 0.40)
-            segments.append((root[0], root[1], end[0], end[1], 2.0))
+            raw_segments.append((root[0], root[1], end[0], end[1], 2.0))
         for child in range(4):
             start = global_node(float(child // 2), 2.0, 0.40)
             end = global_node(float(child), 4.0, 0.69)
-            segments.append((start[0], start[1], end[0], end[1], 1.0))
+            raw_segments.append((start[0], start[1], end[0], end[1], 1.0))
         for child in range(8):
             start = global_node(float(child // 2), 4.0, 0.69)
             end = global_node(float(child), 8.0, 0.97)
-            segments.append((start[0], start[1], end[0], end[1], 0.0))
+            raw_segments.append((start[0], start[1], end[0], end[1], 0.0))
+
+        segments = []
+        for ax, ay, bx, by, level in raw_segments:
+            segment_x = bx - ax
+            segment_y = by - ay
+            segment_length2 = max(
+                segment_x * segment_x + segment_y * segment_y,
+                0.0001,
+            )
+            inverse_segment_length2 = 1.0 / segment_length2
+            inverse_segment_length = math.sqrt(inverse_segment_length2)
+            direction_x = segment_x * inverse_segment_length
+            direction_y = segment_y * inverse_segment_length
+            segments.append(
+                (
+                    ax,
+                    ay,
+                    segment_x,
+                    segment_y,
+                    inverse_segment_length2,
+                    direction_x * direction_x - direction_y * direction_y,
+                    2.0 * direction_x * direction_y,
+                    1.0 + level * 0.11,
+                )
+            )
 
         self._segment_cache[tile_id] = segments
         return segments
@@ -222,30 +250,33 @@ class VoronoiField:
 
         for tile_y in range(center_tile[1] - 1, center_tile[1] + 2):
             for tile_x in range(center_tile[0] - 1, center_tile[0] + 2):
-                for ax, ay, bx, by, level in self._segments_for_tile(
+                for (
+                    ax,
+                    ay,
+                    segment_x,
+                    segment_y,
+                    inverse_segment_length2,
+                    direction_axis_x,
+                    direction_axis_y,
+                    level_weight,
+                ) in self._segments_for_tile(
                     (tile_x, tile_y)
                 ):
-                    sx = bx - ax
-                    sy = by - ay
-                    segment_length2 = max(sx * sx + sy * sy, 0.0001)
                     t = clamp(
-                        ((point[0] - ax) * sx + (point[1] - ay) * sy)
-                        / segment_length2,
+                        (
+                            (point[0] - ax) * segment_x
+                            + (point[1] - ay) * segment_y
+                        )
+                        * inverse_segment_length2,
                         0.0,
                         1.0,
                     )
-                    ox = point[0] - (ax + sx * t)
-                    oy = point[1] - (ay + sy * t)
+                    ox = point[0] - (ax + segment_x * t)
+                    oy = point[1] - (ay + segment_y * t)
                     weight = math.exp(-(ox * ox + oy * oy) * 0.82)
-                    weight *= 1.0 + level * 0.11
-                    direction = normalize((sx, sy))
-                    orientation_x += weight * (
-                        direction[0] * direction[0]
-                        - direction[1] * direction[1]
-                    )
-                    orientation_y += weight * (
-                        2.0 * direction[0] * direction[1]
-                    )
+                    weight *= level_weight
+                    orientation_x += weight * direction_axis_x
+                    orientation_y += weight * direction_axis_y
                     total_weight += weight
 
         angle = 0.5 * math.atan2(orientation_y, orientation_x)
@@ -762,3 +793,213 @@ def pattern_to_world(parameters: VoronoiParameters, point: Vec2) -> Vec2:
         (u - 0.5) * parameters.width,
         (v - 0.5) * parameters.depth,
     )
+
+
+def render_preview_rgb(
+    parameters: VoronoiParameters,
+    pixel_width: int,
+    pixel_height: int,
+    flow_samples_per_unit: float = 4.0,
+    cancelled: Optional[Callable[[], bool]] = None,
+) -> Optional[bytearray]:
+    """Render the field into a tightly packed top-down RGB byte buffer.
+
+    This path is deliberately preview-specific. It preserves the exact sites,
+    weights, palette selection, edge-width calculation, and rounded Voronoi
+    metric, while bilinearly interpolating the smoothly varying flow frame
+    from a compact grid. Geometry tracing continues to use ``evaluate()`` and
+    is therefore unaffected by this optimization.
+    """
+
+    pixel_width = max(1, int(pixel_width))
+    pixel_height = max(1, int(pixel_height))
+    pattern_width = parameters.pattern_width
+    pattern_height = parameters.pattern_height
+    field = VoronoiField(parameters)
+
+    flow_columns = min(
+        pixel_width + 1,
+        max(2, int(math.ceil(pattern_width * flow_samples_per_unit)) + 1),
+    )
+    flow_rows = min(
+        pixel_height + 1,
+        max(2, int(math.ceil(pattern_height * flow_samples_per_unit)) + 1),
+    )
+    flow_grid: List[List[Tuple[float, float, float]]] = []
+    for row in range(flow_rows):
+        if cancelled is not None and cancelled():
+            return None
+        pattern_y = pattern_height * row / float(flow_rows - 1)
+        flow_row = []
+        for column in range(flow_columns):
+            pattern_x = pattern_width * column / float(flow_columns - 1)
+            flow_row.append(field.flow_frame((pattern_x, pattern_y)))
+        flow_grid.append(flow_row)
+
+    x_samples = []
+    for image_x in range(pixel_width):
+        grid_x = (image_x + 0.5) * (flow_columns - 1) / float(pixel_width)
+        x0 = min(int(grid_x), flow_columns - 2)
+        x_samples.append((x0, x0 + 1, grid_x - x0))
+
+    y_samples = []
+    for image_y in range(pixel_height):
+        pattern_y = pattern_height * (
+            pixel_height - image_y - 0.5
+        ) / pixel_height
+        grid_y = pattern_y * (flow_rows - 1) / pattern_height
+        y0 = min(int(grid_y), flow_rows - 2)
+        y_samples.append((pattern_y, y0, y0 + 1, grid_y - y0))
+
+    variation = max(parameters.size_variation, 0.0)
+    candidate_radius = 2 + int(math.ceil(math.sqrt(variation)))
+    candidate_cache: Dict[CellId, List[Tuple[float, float, float, int]]] = {}
+
+    def candidates_for(point_x: float, point_y: float):
+        tile_id = (int(math.floor(point_x)), int(math.floor(point_y)))
+        candidates = candidate_cache.get(tile_id)
+        if candidates is not None:
+            return candidates
+        candidates = []
+        for cell_y in range(
+            tile_id[1] - candidate_radius,
+            tile_id[1] + candidate_radius + 1,
+        ):
+            for cell_x in range(
+                tile_id[0] - candidate_radius,
+                tile_id[0] + candidate_radius + 1,
+            ):
+                info = field._site_info((cell_x, cell_y))
+                candidates.append(
+                    (
+                        info.position[0],
+                        info.position[1],
+                        info.weight,
+                        info.color_index,
+                    )
+                )
+        candidate_cache[tile_id] = candidates
+        return candidates
+
+    tributary = clamp(parameters.tributary_bias, 0.0, 1.0)
+    parallelism = clamp(parameters.channel_parallelism, 0.0, 1.0)
+    metric_aspect = 1.0 + 8.0 * tributary + 14.0 * parallelism
+    area_scale = math.sqrt(metric_aspect)
+    inverse_area_scale = 1.0 / area_scale
+    alignment_amount = 0.88 * tributary + 0.96 * parallelism
+    shape_smoothness = clamp(parameters.shape_smoothness, 0.0, 1.0)
+    rounding = max(0.001, 0.28 * shape_smoothness)
+    half_edge_width = max(parameters.edge_width, 0.001) * 0.5
+    pixel_size = max(
+        pattern_width / float(pixel_width),
+        pattern_height / float(pixel_height),
+    )
+    anti_alias = max(pixel_size * 0.70, 0.001)
+    inverse_anti_alias_width = 1.0 / (2.0 * anti_alias)
+    pixels = bytearray(pixel_width * pixel_height * 3)
+    metrics = [0.0] * ((candidate_radius * 2 + 1) ** 2)
+    distances = [0.0] * len(metrics)
+
+    for image_y, (pattern_y, y0, y1, amount_y) in enumerate(y_samples):
+        if cancelled is not None and cancelled():
+            return None
+        flow_row_0 = flow_grid[y0]
+        flow_row_1 = flow_grid[y1]
+        row_offset = image_y * pixel_width * 3
+
+        for image_x, (x0, x1, amount_x) in enumerate(x_samples):
+            pattern_x = pattern_width * (image_x + 0.5) / pixel_width
+            flow_00 = flow_row_0[x0]
+            flow_10 = flow_row_0[x1]
+            flow_01 = flow_row_1[x0]
+            flow_11 = flow_row_1[x1]
+            lower_x = flow_00[0] + (flow_10[0] - flow_00[0]) * amount_x
+            lower_y = flow_00[1] + (flow_10[1] - flow_00[1]) * amount_x
+            lower_confidence = flow_00[2] + (
+                flow_10[2] - flow_00[2]
+            ) * amount_x
+            upper_x = flow_01[0] + (flow_11[0] - flow_01[0]) * amount_x
+            upper_y = flow_01[1] + (flow_11[1] - flow_01[1]) * amount_x
+            upper_confidence = flow_01[2] + (
+                flow_11[2] - flow_01[2]
+            ) * amount_x
+            flow_x = lower_x + (upper_x - lower_x) * amount_y
+            flow_y = lower_y + (upper_y - lower_y) * amount_y
+            confidence = lower_confidence + (
+                upper_confidence - lower_confidence
+            ) * amount_y
+            flow_length = math.sqrt(flow_x * flow_x + flow_y * flow_y)
+            if flow_length > 1.0e-12:
+                flow_x /= flow_length
+                flow_y /= flow_length
+            else:
+                flow_x, flow_y = 0.0, 1.0
+            normal_x, normal_y = -flow_y, flow_x
+            alignment = clamp(alignment_amount * confidence, 0.0, 1.0)
+
+            candidates = candidates_for(pattern_x, pattern_y)
+            nearest_metric = float("inf")
+            nearest_distance = float("inf")
+            winner_index = 0
+            for candidate_index, candidate in enumerate(candidates):
+                dx = pattern_x - candidate[0]
+                dy = pattern_y - candidate[1]
+                distance = math.sqrt(dx * dx + dy * dy)
+                point_metric = dx * dx + dy * dy
+                along = dx * flow_x + dy * flow_y
+                across = dx * normal_x + dy * normal_y
+                aligned_metric = (
+                    across * across * area_scale
+                    + along * along * inverse_area_scale
+                )
+                metric = point_metric + (
+                    aligned_metric - point_metric
+                ) * alignment
+                metric -= variation * candidate[2]
+                metrics[candidate_index] = metric
+                distances[candidate_index] = distance
+                if metric < nearest_metric:
+                    nearest_metric = metric
+                    nearest_distance = distance
+                    winner_index = candidate_index
+
+            angular_gap = float("inf")
+            rounded_gap = float("inf")
+            for candidate_index in range(len(candidates)):
+                if candidate_index == winner_index:
+                    continue
+                gap = (metrics[candidate_index] - nearest_metric) / max(
+                    distances[candidate_index] + nearest_distance,
+                    0.001,
+                )
+                if gap < angular_gap:
+                    angular_gap = gap
+                blend = max(rounding - abs(rounded_gap - gap), 0.0) / rounding
+                rounded_gap = min(rounded_gap, gap) - (
+                    blend * blend * rounding * 0.25
+                )
+
+            boundary = angular_gap + (
+                rounded_gap - angular_gap
+            ) * shape_smoothness
+            domain_margin = min(
+                pattern_x,
+                pattern_width - pattern_x,
+                pattern_y,
+                pattern_height - pattern_y,
+            )
+            margin = min(boundary, domain_margin) - half_edge_width
+            amount = clamp(
+                (margin + anti_alias) * inverse_anti_alias_width,
+                0.0,
+                1.0,
+            )
+            amount = amount * amount * (3.0 - 2.0 * amount)
+            faded_channel = int(round(255.0 * (1.0 - amount)))
+            color_index = candidates[winner_index][3]
+            pixel_offset = row_offset + image_x * 3
+            pixels[pixel_offset] = 255 if color_index == 0 else faded_channel
+            pixels[pixel_offset + 1] = 255 if color_index == 1 else faded_channel
+            pixels[pixel_offset + 2] = 255 if color_index == 2 else faded_channel
+
+    return pixels
