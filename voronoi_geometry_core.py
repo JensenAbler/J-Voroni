@@ -11,6 +11,8 @@ from dataclasses import dataclass
 import math
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import j_voroni_earcut
+
 
 TAU = math.pi * 2.0
 Vec2 = Tuple[float, float]
@@ -130,6 +132,13 @@ class CellPolygon:
     color_index: int
     center: Vec2
     points: List[Vec2]
+
+
+@dataclass
+class MeshBuffers:
+    vertices: List[Tuple[float, float, float]]
+    polygon_counts: List[int]
+    polygon_connects: List[int]
 
 
 @dataclass
@@ -639,20 +648,36 @@ class VoronoiField:
         if maximum <= 1.0e-12:
             return center
 
-        edge_point = (
-            center[0] + direction[0] * maximum,
-            center[1] + direction[1] * maximum,
-        )
-        probe_distance = max(0.0, maximum - 1.0e-7)
-        probe = (
-            center[0] + direction[0] * probe_distance,
-            center[1] + direction[1] * probe_distance,
-        )
-        if self.interior_margin(probe, cell_id) >= 0.0:
-            return edge_point
-
+        # Ownership along a tributary-distorted ray is not necessarily
+        # monotonic: a cell can lose a ray and appear again farther away.
+        # Bracket the first exit before bisection instead of assuming that the
+        # domain endpoint and center surround the desired crossing.
         low = 0.0
-        high = maximum
+        low_margin = self.interior_margin(center, cell_id)
+        high = None
+        minimum_step = max(self.parameters.edge_width * 0.10, 0.002)
+        for _ in range(256):
+            step = clamp(low_margin * 0.45, minimum_step, 0.20)
+            probe_distance = min(low + step, maximum)
+            probe = (
+                center[0] + direction[0] * probe_distance,
+                center[1] + direction[1] * probe_distance,
+            )
+            probe_margin = self.interior_margin(probe, cell_id)
+            if probe_margin < 0.0:
+                high = probe_distance
+                break
+            if probe_distance >= maximum - 1.0e-12:
+                return probe
+            low = probe_distance
+            low_margin = probe_margin
+        if high is None:
+            raise RuntimeError(
+                "Could not bracket the first boundary exit for cell {}.".format(
+                    cell_id
+                )
+            )
+
         for _ in range(max(8, self.parameters.root_iterations)):
             midpoint = (low + high) * 0.5
             point = (
@@ -705,7 +730,25 @@ class VoronoiField:
                     midpoint_point[1] - chord_midpoint[1],
                 )
             )
-            if error <= tolerance or depth >= self.parameters.max_refinement:
+            # A low chord-error alone is insufficient on a concave cell: the
+            # straight segment can briefly leave its owner and overlap a
+            # neighboring island. Require the chord midpoint to remain inside
+            # and permit a few safety subdivisions beyond the visual curve
+            # refinement limit when topology needs them.
+            chord_is_inside = True
+            for chord_amount in (0.25, 0.50, 0.75):
+                chord_probe = (
+                    point_a[0] + (point_b[0] - point_a[0]) * chord_amount,
+                    point_a[1] + (point_b[1] - point_a[1]) * chord_amount,
+                )
+                if self.interior_margin(chord_probe, cell_id) < -tolerance * 0.001:
+                    chord_is_inside = False
+                    break
+            visual_limit = self.parameters.max_refinement
+            topology_limit = visual_limit + 4
+            if (error <= tolerance or depth >= visual_limit) and chord_is_inside:
+                return [(angle_b, point_b)]
+            if depth >= topology_limit:
                 return [(angle_b, point_b)]
             return (
                 refine(
@@ -793,6 +836,280 @@ def pattern_to_world(parameters: VoronoiParameters, point: Vec2) -> Vec2:
         (u - 0.5) * parameters.width,
         (v - 0.5) * parameters.depth,
     )
+
+
+def build_punched_edge_mesh(
+    parameters: VoronoiParameters,
+    polygons: Sequence[CellPolygon],
+    height: float,
+) -> MeshBuffers:
+    """Build a watertight rectangular solid with every cell loop punched out.
+
+    Cap triangulation is performed in Python so Maya receives only ordinary
+    triangles and quads. This avoids Maya's version-dependent handling of one
+    polygon face carrying many hole contours.
+    """
+
+    if not polygons:
+        raise ValueError("The edge mesh requires at least one cell polygon.")
+    height = max(float(height), 1.0e-8)
+    half_width = parameters.width * 0.5
+    half_depth = parameters.depth * 0.5
+    domain_scale = max(parameters.width, parameters.depth, 1.0)
+    root_precision = domain_scale / float(
+        2 ** max(1, int(parameters.root_iterations))
+    )
+    cleanup_epsilon = max(
+        domain_scale * 1.0e-10,
+        min(domain_scale * 1.0e-4, root_precision * 2.0),
+    )
+    cleanup_epsilon2 = cleanup_epsilon * cleanup_epsilon
+
+    def clean_ring(points: Sequence[Vec2]) -> List[Vec2]:
+        cleaned: List[Vec2] = []
+        for point in points:
+            candidate = (float(point[0]), float(point[1]))
+            if cleaned:
+                dx = candidate[0] - cleaned[-1][0]
+                dy = candidate[1] - cleaned[-1][1]
+                if dx * dx + dy * dy <= cleanup_epsilon2:
+                    continue
+            cleaned.append(candidate)
+        if len(cleaned) > 1:
+            dx = cleaned[0][0] - cleaned[-1][0]
+            dy = cleaned[0][1] - cleaned[-1][1]
+            if dx * dx + dy * dy <= cleanup_epsilon2:
+                cleaned.pop()
+
+        changed = True
+        while changed and len(cleaned) >= 3:
+            changed = False
+            result = []
+            count = len(cleaned)
+            for index, point in enumerate(cleaned):
+                previous = cleaned[(index - 1) % count]
+                following = cleaned[(index + 1) % count]
+                previous_x = point[0] - previous[0]
+                previous_y = point[1] - previous[1]
+                following_x = following[0] - point[0]
+                following_y = following[1] - point[1]
+                cross = previous_x * following_y - previous_y * following_x
+                same_direction = (
+                    previous_x * following_x + previous_y * following_y
+                ) >= 0.0
+                scale = max(
+                    abs(previous_x),
+                    abs(previous_y),
+                    abs(following_x),
+                    abs(following_y),
+                    1.0,
+                )
+                if abs(cross) <= cleanup_epsilon * scale and same_direction:
+                    changed = True
+                    continue
+                result.append(point)
+            cleaned = result
+        if len(cleaned) < 3:
+            raise ValueError("An EDGE contour collapsed below three points.")
+        return cleaned
+
+    outer_ring = [
+        (-half_width, -half_depth),
+        (-half_width, half_depth),
+        (half_width, half_depth),
+        (half_width, -half_depth),
+    ]
+    rings = [outer_ring]
+    for polygon in polygons:
+        rings.append(
+            clean_ring(
+                [
+                    pattern_to_world(parameters, point)
+                    for point in polygon.points
+                ]
+            )
+        )
+
+    flat_coordinates: List[float] = []
+    flat_points: List[Vec2] = []
+    contour_indices: List[List[int]] = []
+    hole_indices: List[int] = []
+    for ring_index, ring in enumerate(rings):
+        if ring_index:
+            hole_indices.append(len(flat_points))
+        indices = []
+        for point in ring:
+            indices.append(len(flat_points))
+            flat_points.append(point)
+            flat_coordinates.extend(point)
+        contour_indices.append(indices)
+
+    triangle_indices = j_voroni_earcut.earcut(
+        flat_coordinates,
+        hole_indices,
+        2,
+    )
+    if not triangle_indices or len(triangle_indices) % 3:
+        raise RuntimeError("Earcut did not return complete EDGE cap triangles.")
+
+    def signed_area(indices: Sequence[int]) -> float:
+        area = 0.0
+        for index, vertex_id in enumerate(indices):
+            next_id = indices[(index + 1) % len(indices)]
+            point = flat_points[vertex_id]
+            next_point = flat_points[next_id]
+            area += point[0] * next_point[1] - next_point[0] * point[1]
+        return area * 0.5
+
+    expected_cap_area = abs(signed_area(contour_indices[0]))
+    for contour in contour_indices[1:]:
+        expected_cap_area -= abs(signed_area(contour))
+    if expected_cap_area <= 0.0:
+        raise RuntimeError(
+            "The inset cells consume the entire rectangular EDGE domain."
+        )
+
+    # Earcut intentionally removes redundant collinear boundary vertices.
+    # Compact to the vertices it actually used, then derive wall contours from
+    # the cap's real boundary edges so cap and wall topology always agree.
+    used_source_ids = sorted(set(triangle_indices))
+    source_to_compact = {
+        source_id: compact_id
+        for compact_id, source_id in enumerate(used_source_ids)
+    }
+    flat_points = [flat_points[source_id] for source_id in used_source_ids]
+    triangle_indices = [
+        source_to_compact[source_id] for source_id in triangle_indices
+    ]
+
+    vertex_count = len(flat_points)
+    vertices = [(point[0], 0.0, point[1]) for point in flat_points]
+    vertices.extend((point[0], height, point[1]) for point in flat_points)
+    faces: List[Tuple[int, ...]] = []
+    cap_area = 0.0
+    cap_edge_use: Dict[Tuple[int, int], int] = {}
+
+    for index in range(0, len(triangle_indices), 3):
+        a, b, c = triangle_indices[index : index + 3]
+        point_a = flat_points[a]
+        point_b = flat_points[b]
+        point_c = flat_points[c]
+        cross_y = (
+            (point_b[1] - point_a[1]) * (point_c[0] - point_a[0])
+            - (point_b[0] - point_a[0]) * (point_c[1] - point_a[1])
+        )
+        if abs(cross_y) <= 1.0e-14:
+            continue
+        if cross_y < 0.0:
+            b, c = c, b
+            cross_y = -cross_y
+        cap_area += cross_y * 0.5
+        faces.append((a, c, b))
+        faces.append(
+            (a + vertex_count, b + vertex_count, c + vertex_count)
+        )
+        for vertex_a, vertex_b in ((a, b), (b, c), (c, a)):
+            edge = (
+                (vertex_a, vertex_b)
+                if vertex_a < vertex_b
+                else (vertex_b, vertex_a)
+            )
+            cap_edge_use[edge] = cap_edge_use.get(edge, 0) + 1
+
+    area_tolerance = max(1.0e-7, expected_cap_area * 1.0e-6)
+    if abs(cap_area - expected_cap_area) > area_tolerance:
+        raise RuntimeError(
+            "EDGE cap triangulation covered {:.8g} square units; expected "
+            "{:.8g}.".format(cap_area, expected_cap_area)
+        )
+
+    boundary_edges = {
+        edge for edge, uses in cap_edge_use.items() if uses == 1
+    }
+    boundary_adjacency: Dict[int, List[int]] = {}
+    for vertex_a, vertex_b in boundary_edges:
+        boundary_adjacency.setdefault(vertex_a, []).append(vertex_b)
+        boundary_adjacency.setdefault(vertex_b, []).append(vertex_a)
+    invalid_vertices = [
+        vertex_id
+        for vertex_id, neighbors in boundary_adjacency.items()
+        if len(neighbors) != 2
+    ]
+    if invalid_vertices:
+        raise RuntimeError(
+            "EDGE cap boundary does not form closed loops at {} vertices.".format(
+                len(invalid_vertices)
+            )
+        )
+
+    boundary_loops: List[List[int]] = []
+    unvisited_edges = set(boundary_edges)
+    while unvisited_edges:
+        start, current = next(iter(unvisited_edges))
+        contour = [start]
+        previous = start
+        unvisited_edges.remove((min(start, current), max(start, current)))
+        while current != start:
+            contour.append(current)
+            neighbors = boundary_adjacency[current]
+            following = neighbors[0] if neighbors[0] != previous else neighbors[1]
+            edge = (min(current, following), max(current, following))
+            if edge not in unvisited_edges:
+                if following != start:
+                    raise RuntimeError("EDGE cap boundary loop terminated early.")
+            else:
+                unvisited_edges.remove(edge)
+            previous, current = current, following
+        boundary_loops.append(contour)
+
+    outer_loop_index = max(
+        range(len(boundary_loops)),
+        key=lambda index: abs(signed_area(boundary_loops[index])),
+    )
+    for contour_index, source_contour in enumerate(boundary_loops):
+        contour = list(source_contour)
+        contour_area = signed_area(contour)
+        if (contour_index == outer_loop_index and contour_area > 0.0) or (
+            contour_index != outer_loop_index and contour_area < 0.0
+        ):
+            contour.reverse()
+        for index, bottom_a in enumerate(contour):
+            bottom_b = contour[(index + 1) % len(contour)]
+            faces.append(
+                (
+                    bottom_a,
+                    bottom_b,
+                    bottom_b + vertex_count,
+                    bottom_a + vertex_count,
+                )
+            )
+
+    edge_use: Dict[Tuple[int, int], int] = {}
+    for face in faces:
+        for index, vertex_a in enumerate(face):
+            vertex_b = face[(index + 1) % len(face)]
+            edge = (
+                (vertex_a, vertex_b)
+                if vertex_a < vertex_b
+                else (vertex_b, vertex_a)
+            )
+            edge_use[edge] = edge_use.get(edge, 0) + 1
+    non_manifold_edges = [edge for edge, uses in edge_use.items() if uses != 2]
+    if non_manifold_edges:
+        examples = [
+            "{}:{}".format(edge, edge_use[edge])
+            for edge in non_manifold_edges[:8]
+        ]
+        raise RuntimeError(
+            "EDGE triangulation produced {} non-watertight edges ({}).".format(
+                len(non_manifold_edges),
+                ", ".join(examples),
+            )
+        )
+
+    polygon_counts = [len(face) for face in faces]
+    polygon_connects = [vertex_id for face in faces for vertex_id in face]
+    return MeshBuffers(vertices, polygon_counts, polygon_connects)
 
 
 def render_preview_rgb(

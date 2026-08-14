@@ -24,7 +24,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 import voronoi_geometry_core as core
 
 
-TOOL_VERSION = "0.2.0"
+TOOL_VERSION = "0.2.1"
 WINDOW_OBJECT = "VoronoiGeometryBakerWindow"
 PREVIEW_GROUP = "VORONOI_GEO_PREVIEW_GRP"
 PREVIEW_PLANE = "voronoiGeo_previewPlane"
@@ -977,170 +977,63 @@ class VoronoiGeometryWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         name: str,
         height: float,
     ) -> str:
-        half_width = parameters.width * 0.5
-        half_depth = parameters.depth * 0.5
-
-        # Clockwise in X/Z gives the outer face a +Y normal. Hole loops use
-        # the opposite winding and are exactly the same loops as RGB tops.
-        point_data: List[Tuple[float, float, float]] = [
-            (-half_width, 0.0, -half_depth),
-            (-half_width, 0.0, half_depth),
-            (half_width, 0.0, half_depth),
-            (half_width, 0.0, -half_depth),
-        ]
-        for polygon in polygons:
-            point_data.append(())
-            for point in polygon.points:
-                x, z = core.pattern_to_world(parameters, point)
-                point_data.append((x, 0.0, z))
-
-        source_result = cmds.polyCreateFacet(
-            point=point_data,
-            name=name + "_tessellationSource",
-            constructionHistory=False,
-            texture=0,
-        )
-        source_mesh = source_result[0]
-
+        direct_error = None
         try:
-            selection = om.MSelectionList()
-            selection.add(source_mesh)
-            source_path = selection.getDagPath(0)
-            if source_path.node().hasFn(om.MFn.kTransform):
-                source_path.extendToShape()
-            source_function = om.MFnMesh(source_path)
-
-            holes = source_function.getHoles()
-            if len(holes) != len(polygons):
-                raise RuntimeError(
-                    "Maya registered {} cell holes, but {} were supplied.".format(
-                        len(holes), len(polygons)
-                    )
-                )
-
-            source_points = list(source_function.getPoints(om.MSpace.kObject))
-            _triangle_counts, triangle_vertices = source_function.getTriangles()
-            triangle_vertices = list(triangle_vertices)
-            if not triangle_vertices:
-                raise RuntimeError("Maya could not tessellate the edge complement.")
-
-            # Retain Maya's exact hole vertex IDs so the caps and vertical hole
-            # walls share vertices. That makes the finished edge one watertight
-            # connected mesh instead of coincident sticker-like surfaces.
-            hole_contours = [list(vertex_ids) for _face, vertex_ids in holes]
-
-            def signed_area(vertex_ids):
-                area = 0.0
-                for index, vertex_id in enumerate(vertex_ids):
-                    next_id = vertex_ids[(index + 1) % len(vertex_ids)]
-                    point = source_points[vertex_id]
-                    next_point = source_points[next_id]
-                    area += point.x * next_point.z - next_point.x * point.z
-                return area * 0.5
-
-            # Locate the four outer vertices by position; all remaining
-            # contours come directly from getHoles().
-            outer_targets = point_data[:4]
-            outer_contour = []
-            for target_x, _target_y, target_z in outer_targets:
-                vertex_id = min(
-                    range(len(source_points)),
-                    key=lambda candidate: (
-                        (source_points[candidate].x - target_x) ** 2
-                        + (source_points[candidate].z - target_z) ** 2
-                    ),
-                )
-                distance_squared = (
-                    (source_points[vertex_id].x - target_x) ** 2
-                    + (source_points[vertex_id].z - target_z) ** 2
-                )
-                if distance_squared > 1.0e-10:
-                    raise RuntimeError("Could not recover the outer edge contour.")
-                outer_contour.append(vertex_id)
-
-            # All contours are oriented with the solid edge region on their
-            # right. The side-quad winding below consequently points outward.
-            if signed_area(outer_contour) > 0.0:
-                outer_contour.reverse()
-            for contour in hole_contours:
-                if signed_area(contour) < 0.0:
-                    contour.reverse()
-
-            vertex_count = len(source_points)
-            vertices = [om.MPoint(point.x, 0.0, point.z) for point in source_points]
-            vertices.extend(
-                om.MPoint(point.x, height, point.z) for point in source_points
+            return self._create_edge_mesh_from_buffers(
+                polygons,
+                parameters,
+                name,
+                height,
             )
-            polygon_counts: List[int] = []
-            polygon_connects: List[int] = []
-            cap_area = 0.0
+        except Exception as exc:
+            direct_error = exc
 
-            for index in range(0, len(triangle_vertices), 3):
-                a, b, c = triangle_vertices[index : index + 3]
-                point_a = source_points[a]
-                point_b = source_points[b]
-                point_c = source_points[c]
-                cross_y = (
-                    (point_b.z - point_a.z) * (point_c.x - point_a.x)
-                    - (point_b.x - point_a.x) * (point_c.z - point_a.z)
+        # Maya's exact boolean is a robust fallback for dense or extremely
+        # smooth multi-hole caps. The cutters are the same mathematical inset
+        # polygons as the RGB pieces, extended slightly through the plate, so
+        # this still creates their genuine complementary edge network.
+        try:
+            return self._create_edge_mesh_with_boolean(
+                polygons,
+                parameters,
+                name,
+                height,
+            )
+        except Exception as boolean_error:
+            raise RuntimeError(
+                "J-Voroni could not create EDGE geometry. Direct topology: "
+                "{}. Maya exact boolean: {}.".format(
+                    direct_error,
+                    boolean_error,
                 )
-                if abs(cross_y) <= 1.0e-12:
-                    continue
-                if cross_y < 0.0:
-                    b, c = c, b
-                    cross_y = -cross_y
-                cap_area += cross_y * 0.5
-                polygon_counts.extend((3, 3))
-                polygon_connects.extend((a, c, b))
-                polygon_connects.extend(
-                    (a + vertex_count, b + vertex_count, c + vertex_count)
+            ) from boolean_error
+
+    def _create_edge_mesh_from_buffers(
+        self,
+        polygons: Sequence[core.CellPolygon],
+        parameters: core.VoronoiParameters,
+        name: str,
+        height: float,
+    ) -> str:
+        try:
+            mesh_data = core.build_punched_edge_mesh(
+                parameters,
+                polygons,
+                height,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "J-Voroni could not construct the punched EDGE topology: {}".format(
+                    exc
                 )
-
-            expected_cap_area = parameters.width * parameters.depth
-            for polygon in polygons:
-                world_points = [
-                    core.pattern_to_world(parameters, point)
-                    for point in polygon.points
-                ]
-                polygon_area = 0.0
-                for index, point in enumerate(world_points):
-                    next_point = world_points[(index + 1) % len(world_points)]
-                    polygon_area += (
-                        point[0] * next_point[1] - next_point[0] * point[1]
-                    )
-                expected_cap_area -= abs(polygon_area) * 0.5
-
-            area_tolerance = max(1.0e-6, abs(expected_cap_area) * 0.005)
-            if abs(cap_area - expected_cap_area) > area_tolerance:
-                raise RuntimeError(
-                    "Maya's edge tessellation covered {:.6g} square units; "
-                    "the punched complement should cover {:.6g}.".format(
-                        cap_area, expected_cap_area
-                    )
-                )
-
-            for contour in [outer_contour] + hole_contours:
-                for index, bottom_a in enumerate(contour):
-                    bottom_b = contour[(index + 1) % len(contour)]
-                    polygon_counts.append(4)
-                    polygon_connects.extend(
-                        (
-                            bottom_a,
-                            bottom_b,
-                            bottom_b + vertex_count,
-                            bottom_a + vertex_count,
-                        )
-                    )
-        finally:
-            if cmds.objExists(source_mesh):
-                cmds.delete(source_mesh)
+            ) from exc
 
         edge_mesh = cmds.createNode("transform", name=name)
         mesh_function = om.MFnMesh()
         mesh_object = mesh_function.create(
-            vertices,
-            polygon_counts,
-            polygon_connects,
+            [om.MPoint(*point) for point in mesh_data.vertices],
+            mesh_data.polygon_counts,
+            mesh_data.polygon_connects,
             parent=self._mobject(edge_mesh),
         )
         om.MFnDagNode(mesh_object).setName(name + "Shape")
@@ -1171,6 +1064,120 @@ class VoronoiGeometryWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         except RuntimeError:
             pass
         return edge_mesh
+
+    def _create_edge_mesh_with_boolean(
+        self,
+        polygons: Sequence[core.CellPolygon],
+        parameters: core.VoronoiParameters,
+        name: str,
+        height: float,
+    ) -> str:
+        if not polygons:
+            raise RuntimeError("There are no inset cells to punch from EDGE.")
+
+        height = max(float(height), 1.0e-6)
+        overshoot = max(
+            height * 0.1,
+            max(parameters.width, parameters.depth) * 1.0e-5,
+            0.001,
+        )
+        temporary_nodes = []
+        result_mesh = None
+        try:
+            plate_result = cmds.polyCube(
+                width=parameters.width,
+                height=height,
+                depth=parameters.depth,
+                subdivisionsX=1,
+                subdivisionsY=1,
+                subdivisionsZ=1,
+                constructionHistory=False,
+                name=name + "_plate_TMP",
+            )
+            plate = plate_result[0] if isinstance(plate_result, (list, tuple)) else plate_result
+            temporary_nodes.append(plate)
+            cmds.move(0.0, height * 0.5, 0.0, plate, absolute=True)
+
+            cutter = self._create_color_mesh(
+                polygons,
+                parameters,
+                name + "_cutters_TMP",
+                height + overshoot * 2.0,
+            )
+            temporary_nodes.append(cutter)
+            cmds.move(0.0, -overshoot, 0.0, cutter, relative=True)
+
+            boolean_result = cmds.polyCBoolOp(
+                plate,
+                cutter,
+                operation=2,
+                classification=2,
+                useThresholds=False,
+                preserveColor=False,
+                constructionHistory=False,
+            )
+            if isinstance(boolean_result, (list, tuple)):
+                if not boolean_result:
+                    raise RuntimeError("Maya returned no boolean result node.")
+                result_mesh = boolean_result[0]
+            else:
+                result_mesh = boolean_result
+            if not result_mesh or not cmds.objExists(result_mesh):
+                raise RuntimeError("Maya returned an invalid boolean result node.")
+
+            result_mesh = cmds.rename(result_mesh, name)
+            try:
+                cmds.delete(result_mesh, constructionHistory=True)
+            except RuntimeError:
+                pass
+
+            shapes = cmds.listRelatives(
+                result_mesh,
+                shapes=True,
+                noIntermediate=True,
+                fullPath=True,
+            ) or []
+            if not shapes:
+                raise RuntimeError("The boolean EDGE result has no mesh shape.")
+            face_count = cmds.polyEvaluate(result_mesh, face=True)
+            if not face_count:
+                raise RuntimeError("The boolean EDGE result contains no faces.")
+
+            selection = om.MSelectionList()
+            selection.add(result_mesh)
+            edge_path = selection.getDagPath(0)
+            if edge_path.node().hasFn(om.MFn.kTransform):
+                edge_path.extendToShape()
+            edge_iterator = om.MItMeshEdge(edge_path)
+            open_edge_count = 0
+            while not edge_iterator.isDone():
+                if edge_iterator.onBoundary():
+                    open_edge_count += 1
+                edge_iterator.next()
+            if open_edge_count:
+                raise RuntimeError(
+                    "The boolean EDGE mesh has {} open boundary edges.".format(
+                        open_edge_count
+                    )
+                )
+
+            try:
+                cmds.polySoftEdge(
+                    result_mesh,
+                    angle=30.0,
+                    constructionHistory=False,
+                )
+            except RuntimeError:
+                pass
+            return result_mesh
+        except Exception:
+            if result_mesh and cmds.objExists(result_mesh):
+                cmds.delete(result_mesh)
+            raise
+        finally:
+            for node in temporary_nodes:
+                if node and cmds.objExists(node):
+                    cmds.delete(node)
 
 
 def show():

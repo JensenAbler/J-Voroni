@@ -81,14 +81,17 @@ EDGE is not a backing plate. Its construction is:
 1. Trace every inset RGB boundary by solving the mathematical ownership field.
 2. Create an outer rectangular contour and register every RGB contour as a
    hole.
-3. Ask Maya's mesh API for a hole-aware planar tessellation.
-4. Build explicit bottom triangles, top triangles, outer walls, and cell-hole
-   walls as one watertight `MFnMesh` solid.
+3. Triangulate that punched complement in Python and build explicit bottom
+   triangles, top triangles, outer walls, and cell-hole walls as one
+   watertight `MFnMesh` solid.
+4. If an unusually dense or smooth contour defeats direct triangulation, use
+   Maya's exact boolean to subtract those same inset cell prisms from the
+   extruded domain.
 
 The tool deliberately does not extrude the original face-with-holes because
-Maya can cap those holes during polygon extrusion. Before accepting EDGE, the
-baker validates its cap area and confirms that the completed solid has zero
-open mesh edges.
+Maya can cap those holes during polygon extrusion. Before accepting EDGE, both
+construction paths confirm that the completed result has faces and zero open
+mesh edges. Temporary boolean plates and cutters are removed automatically.
 
 Hiding RED, GREEN, and BLUE therefore reveals only the connected edge
 channels, filled junctions, and outer border. The RGB tops and EDGE holes use
@@ -101,6 +104,7 @@ Each bake group stores a JSON snapshot of its settings in the custom
 
 - `voronoi_geometry_core.py` - deterministic field evaluation and boundary tracing
 - `voronoi_geometry_tool.py` - Maya UI, preview, materials, and mesh construction
+- `j_voroni_earcut.py` - bundled dependency-free cap triangulation
 - `run_voronoi_geometry_tool.py` - reloadable Maya launcher
 
 ## Suggested first test
